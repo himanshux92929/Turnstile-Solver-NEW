@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Check out the repo (this brings in your proxies.txt file)
+      # 1. Check out the repo (brings in your committed proxies.txt file)
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -52,6 +52,7 @@ jobs:
             libcairo2 libxshmfence1 libx11-xcb1
 
       # 7. Validate and clean the repository's proxies.txt
+      #    The solver expects this exact filename in the root directory.
       - name: Verify and clean proxies.txt
         run: |
           if [ ! -f proxies.txt ]; then
@@ -73,7 +74,8 @@ jobs:
             echo "  … and $((PROXY_COUNT - 10)) more"
           fi
 
-      # 8. Start the solver API in the background using proxies.txt
+      # 8. Start the solver API in the background
+      #    --proxy is a simple switch; it automatically reads the local proxies.txt file.
       - name: Start Turnstile Solver API
         run: |
           source venv/bin/activate
@@ -82,8 +84,7 @@ jobs:
             --thread 2 \
             --port 6080 \
             --host 0.0.0.0 \
-            --proxy proxies.txt \
-            --random \
+            --proxy \
             > solver.log 2>&1 &
           echo $! > solver.pid
           echo "Solver PID: $(cat solver.pid)"
@@ -113,7 +114,6 @@ jobs:
           SITEKEY="0x4AAAAAADnpjMgvQPlaYYog"
           MAX_RETRIES=5
 
-          # One-liner json parser to prevent layout indentation errors completely
           get_json() {
             python3 -c "import sys, json; d = json.load(sys.stdin); print(d.get('$1', ''))" 2>/dev/null || echo ""
           }
@@ -179,7 +179,7 @@ jobs:
                   echo "  Still processing…"
                   ;;
                 *)
-                  echo "  Waiting for result (status='${STATUS}')…"
+                  echo "  Waiting for result (status='${STATUS}')mW…"
                   ;;
               esac
 
