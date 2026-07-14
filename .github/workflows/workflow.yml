@@ -113,15 +113,9 @@ jobs:
           SITEKEY="0x4AAAAAADnpjMgvQPlaYYog"
           MAX_RETRIES=5
 
+          # One-liner json parser to prevent layout indentation errors completely
           get_json() {
-            python3 -c "
-import sys, json
-try:
-    d = json.load(sys.stdin)
-    print(d.get('$1', ''))
-except Exception:
-    print('')
-"
+            python3 -c "import sys, json; d = json.load(sys.stdin); print(d.get('$1', ''))" 2>/dev/null || echo ""
           }
 
           for ATTEMPT in $(seq 1 $MAX_RETRIES); do
