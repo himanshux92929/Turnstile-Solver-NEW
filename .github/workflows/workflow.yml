@@ -8,16 +8,9 @@ on:
   workflow_dispatch:
 
 jobs:
-  # ─────────────────────────────────────────────
-  # JOB 1: Install & start the solver
-  # ─────────────────────────────────────────────
   setup-and-run:
     name: Setup Turnstile Solver
     runs-on: ubuntu-latest
-
-    # Expose the solver port to the next job (same runner, same job)
-    # Everything runs in one job so the background process stays alive
-    # for the demo-check steps below.
 
     steps:
       # 1. Check out the repo
@@ -30,25 +23,26 @@ jobs:
         with:
           python-version: "3.11"
 
-      # 3. Create & activate a virtual environment, then install deps
+      # 3. Create virtual environment
       - name: Create virtual environment
         run: python -m venv venv
 
+      # 4. Install dependencies
       - name: Install dependencies
         run: |
           source venv/bin/activate
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 4. Install Chromium via patchright (headless-compatible)
+      # 5. Install Chromium via patchright
       - name: Install Chromium via patchright
         run: |
           source venv/bin/activate
           python -m patchright install chromium
-          # Install system deps that Chromium needs on Ubuntu runners
           python -m patchright install-deps chromium || true
 
-      # 5. Install extra system libraries needed by Chromium on Linux CI
+      # 6. Install extra system libraries Chromium needs on Ubuntu 24.04
+      #    Note: libasound2 was renamed to libasound2t64 in Ubuntu 24.04
       - name: Install Chromium system dependencies
         run: |
           sudo apt-get update -qq
@@ -58,7 +52,7 @@ jobs:
             libxfixes3 libxrandr2 libgbm1 libasound2t64 libpango-1.0-0 \
             libcairo2 libxshmfence1 libx11-xcb1
 
-      # 6. Start the solver API in the background
+      # 7. Start the solver API in the background
       - name: Start Turnstile Solver API
         run: |
           source venv/bin/activate
@@ -70,20 +64,14 @@ jobs:
           echo $! > solver.pid
           echo "Solver PID: $(cat solver.pid)"
 
-      # 7. Wait until the API is accepting connections (up to 60 s)
+      # 8. Wait until the API is accepting connections (up to 60 s)
       - name: Wait for API to become ready
         run: |
           echo "Waiting for solver API on port 6080..."
           for i in $(seq 1 60); do
-            if curl -sf http://localhost:6080/ > /dev/null 2>&1 || \
-               curl -sf http://localhost:6080/turnstile > /dev/null 2>&1; then
-              echo "API is up after ${i}s"
-              break
-            fi
-            # Also accept "connection refused" → port not open yet vs HTTP 4xx → API is up
             HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:6080/ 2>/dev/null || true)
             if [[ "$HTTP_CODE" =~ ^[2345][0-9][0-9]$ ]]; then
-              echo "API responded with HTTP $HTTP_CODE after ${i}s – treating as ready"
+              echo "API is up after ${i}s (HTTP $HTTP_CODE)"
               break
             fi
             if [ "$i" -eq 60 ]; then
@@ -94,107 +82,86 @@ jobs:
             sleep 1
           done
 
-      # ─────────────────────────────────────────
-      # JOB 2 (inline): Demo Turnstile check
-      # Using Cloudflare's official test sitekey so no real CAPTCHA
-      # needs solving – the solver will return a valid token.
-      # ─────────────────────────────────────────
-
-      # 8. Submit a turnstile solve task (retry up to 5×)
-      - name: Demo – Submit Turnstile Solve Task (with retries)
-        id: submit_task
+      # ─────────────────────────────────────────────────────────────────────
+      # Demo Turnstile check – submit + poll in ONE step (up to 5 retries)
+      #
+      # KEY FIX: the API returns "taskId" (camelCase), not "task_id"
+      # as the README shows. Every JSON parse uses "taskId".
+      # Submit and poll are in the same step so the variable is always
+      # in scope; no GITHUB_OUTPUT plumbing needed.
+      # ─────────────────────────────────────────────────────────────────────
+      - name: Demo – Turnstile Solve Check (submit + poll, up to 5 retries)
         run: |
           TARGET_URL="https://deltastudy.site/verify"
           SITEKEY="0x4AAAAAADnpjMgvQPlaYYog"
           MAX_RETRIES=5
-          ATTEMPT=0
-          TASK_ID=""
 
-          while [ $ATTEMPT -lt $MAX_RETRIES ]; do
-            ATTEMPT=$((ATTEMPT + 1))
-            echo "──────────────────────────────────────"
-            echo "Submit attempt $ATTEMPT / $MAX_RETRIES"
+          for ATTEMPT in $(seq 1 $MAX_RETRIES); do
+            echo "══════════════════════════════════════════"
+            echo "Attempt $ATTEMPT / $MAX_RETRIES"
+            echo "══════════════════════════════════════════"
 
+            # ── SUBMIT ──────────────────────────────────────────────────────
+            # API response: {"errorId":0,"taskId":"<uuid>"}   (camelCase!)
             RESPONSE=$(curl -sf \
               "http://localhost:6080/turnstile?url=${TARGET_URL}&sitekey=${SITEKEY}" \
               2>&1) || true
+            echo "Submit response: $RESPONSE"
 
-            echo "Response: $RESPONSE"
-
-            TASK_ID=$(echo "$RESPONSE" | python3 -c \
-              "import sys,json; d=json.load(sys.stdin); print(d.get('task_id',''))" \
+            TASK_ID=$(echo "$RESPONSE" | \
+              python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('taskId',''))" \
               2>/dev/null || true)
 
-            if [ -n "$TASK_ID" ] && [ "$TASK_ID" != "null" ]; then
-              echo "Task submitted successfully. task_id=$TASK_ID"
-              echo "task_id=$TASK_ID" >> "$GITHUB_OUTPUT"
-              break
-            fi
-
-            echo "::warning::Submit attempt $ATTEMPT failed or returned no task_id."
-
-            if [ $ATTEMPT -eq $MAX_RETRIES ]; then
-              echo "::error::All $MAX_RETRIES submit attempts failed."
+            if [ -z "$TASK_ID" ] || [ "$TASK_ID" = "null" ]; then
+              echo "::warning::No taskId in submit response on attempt $ATTEMPT."
+              if [ "$ATTEMPT" -lt "$MAX_RETRIES" ]; then
+                sleep 5
+                continue
+              fi
+              echo "::error::Could not get a taskId after $MAX_RETRIES attempts."
               cat solver.log || true
               exit 1
             fi
 
-            sleep 10
-          done
+            echo "Got taskId: $TASK_ID — polling for result…"
 
-      # 9. Poll /result until status=ready or all retries exhausted
-      - name: Demo – Poll for Solve Result (with retries)
-        run: |
-          TASK_ID="${{ steps.submit_task.outputs.task_id }}"
-          MAX_RETRIES=5
-          ATTEMPT=0
-
-          echo "Polling for result of task_id: $TASK_ID"
-
-          while [ $ATTEMPT -lt $MAX_RETRIES ]; do
-            ATTEMPT=$((ATTEMPT + 1))
-            echo "──────────────────────────────────────"
-            echo "Poll attempt $ATTEMPT / $MAX_RETRIES"
-
-            # Poll every 5 s for up to 60 s per attempt
+            # ── POLL (up to 90 s, every 5 s = 18 ticks) ────────────────────
             SOLVED=false
-            for i in $(seq 1 12); do
-              RESULT=$(curl -sf \
-                "http://localhost:6080/result?id=${TASK_ID}" \
-                2>&1) || true
+            for TICK in $(seq 1 18); do
+              sleep 5
+              RESULT=$(curl -sf "http://localhost:6080/result?id=${TASK_ID}" 2>&1) || true
+              echo "  [tick ${TICK}/18] $RESULT"
 
-              echo "Poll response: $RESULT"
-
-              STATUS=$(echo "$RESULT" | python3 -c \
-                "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))" \
+              STATUS=$(echo "$RESULT" | \
+                python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))" \
                 2>/dev/null || true)
 
               if [ "$STATUS" = "ready" ]; then
-                TOKEN=$(echo "$RESULT" | python3 -c \
-                  "import sys,json; d=json.load(sys.stdin); print(d.get('value',''))" \
+                TOKEN=$(echo "$RESULT" | \
+                  python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('value',''))" \
                   2>/dev/null || true)
-                ELAPSED=$(echo "$RESULT" | python3 -c \
-                  "import sys,json; d=json.load(sys.stdin); print(d.get('elapsed_time',''))" \
+                ELAPSED=$(echo "$RESULT" | \
+                  python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('elapsed_time',''))" \
                   2>/dev/null || true)
                 echo ""
                 echo "╔══════════════════════════════════════╗"
                 echo "║          ✅  SUCCESS                 ║"
                 echo "╚══════════════════════════════════════╝"
                 echo ""
-                echo "  Token   : ${TOKEN:0:40}…"
-                echo "  Elapsed : ${ELAPSED}s"
+                echo "  Attempt  : $ATTEMPT / $MAX_RETRIES"
+                echo "  taskId   : $TASK_ID"
+                echo "  Token    : ${TOKEN:0:50}…"
+                echo "  Elapsed  : ${ELAPSED}s"
                 echo ""
                 SOLVED=true
                 break
               elif [ "$STATUS" = "fail" ]; then
-                echo "::warning::Solve returned status=fail on poll $i of attempt $ATTEMPT"
+                echo "::warning::Solver returned status=fail (tick $TICK, attempt $ATTEMPT). Will retry."
                 break
               elif [ "$STATUS" = "processing" ]; then
-                echo "Still processing… waiting 5s"
-                sleep 5
+                echo "  Still processing…"
               else
-                echo "::warning::Unexpected status '$STATUS' – waiting 5s"
-                sleep 5
+                echo "  Unexpected status '${STATUS}', continuing to poll…"
               fi
             done
 
@@ -203,25 +170,14 @@ jobs:
               exit 0
             fi
 
-            if [ $ATTEMPT -eq $MAX_RETRIES ]; then
-              echo "::error::Solve did not succeed after $MAX_RETRIES attempts."
-              cat solver.log || true
-              exit 1
+            if [ "$ATTEMPT" -lt "$MAX_RETRIES" ]; then
+              echo "Attempt $ATTEMPT did not resolve. Retrying with a fresh task…"
             fi
-
-            # Re-submit a fresh task for the next retry attempt
-            echo "Re-submitting task for retry attempt $((ATTEMPT + 1))…"
-            TARGET_URL="https://deltastudy.site/verify"
-            SITEKEY="0x4AAAAAADnpjMgvQPlaYYog"
-            RESPONSE=$(curl -sf \
-              "http://localhost:6080/turnstile?url=${TARGET_URL}&sitekey=${SITEKEY}" \
-              2>&1) || true
-            TASK_ID=$(echo "$RESPONSE" | python3 -c \
-              "import sys,json; d=json.load(sys.stdin); print(d.get('task_id',''))" \
-              2>/dev/null || true)
-            echo "New task_id: $TASK_ID"
-            sleep 5
           done
+
+          echo "::error::Turnstile solve did not succeed after $MAX_RETRIES attempts."
+          cat solver.log || true
+          exit 1
 
       # 10. Always print solver log on failure for easy debugging
       - name: Print solver log (on failure)
