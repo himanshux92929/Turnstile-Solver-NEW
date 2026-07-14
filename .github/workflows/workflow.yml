@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Check out the repo
+      # 1. Check out the repo (this brings in your proxies.txt file)
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -42,7 +42,6 @@ jobs:
           python -m patchright install-deps chromium || true
 
       # 6. Install extra system libraries Chromium needs on Ubuntu 24.04
-      #    Note: libasound2 was renamed to libasound2t64 in Ubuntu 24.04
       - name: Install Chromium system dependencies
         run: |
           sudo apt-get update -qq
@@ -52,7 +51,29 @@ jobs:
             libxfixes3 libxrandr2 libgbm1 libasound2t64 libpango-1.0-0 \
             libcairo2 libxshmfence1 libx11-xcb1
 
-      # 7. Start the solver API in the background
+      # 7. Validate and clean the repository's proxies.txt
+      - name: Verify and clean proxies.txt
+        run: |
+          if [ ! -f proxies.txt ]; then
+            echo "::error::proxies.txt was not found in the root of the repository."
+            exit 1
+          fi
+          
+          # Strip Windows-style \r line endings and remove empty lines in-place
+          sed -i 's/\r//g' proxies.txt
+          sed -i '/^[[:space:]]*$/d' proxies.txt
+          
+          PROXY_COUNT=$(wc -l < proxies.txt)
+          echo "Successfully loaded $PROXY_COUNT proxies from repository."
+          
+          # Show hosts only for validation (redacting potential credentials)
+          echo "Proxy hosts (first 10):"
+          awk -F: '{print $1":"$2}' proxies.txt | head -10
+          if [ "$PROXY_COUNT" -gt 10 ]; then
+            echo "  … and $((PROXY_COUNT - 10)) more"
+          fi
+
+      # 8. Start the solver API in the background using proxies.txt
       - name: Start Turnstile Solver API
         run: |
           source venv/bin/activate
@@ -60,11 +81,14 @@ jobs:
             --browser_type chromium \
             --thread 2 \
             --port 6080 \
-            --host 0.0.0.0 > solver.log 2>&1 &
+            --host 0.0.0.0 \
+            --proxy proxies.txt \
+            --random \
+            > solver.log 2>&1 &
           echo $! > solver.pid
           echo "Solver PID: $(cat solver.pid)"
 
-      # 8. Wait until the API is accepting connections (up to 60 s)
+      # 9. Wait until the API is accepting connections (up to 60 s)
       - name: Wait for API to become ready
         run: |
           echo "Waiting for solver API on port 6080..."
@@ -82,42 +106,39 @@ jobs:
             sleep 1
           done
 
-      # ─────────────────────────────────────────────────────────────────────
-      # Demo Turnstile check – submit + poll in ONE step (up to 5 retries)
-      #
-      # KEY FIX: the API returns "taskId" (camelCase), not "task_id"
-      # as the README shows. Every JSON parse uses "taskId".
-      # Submit and poll are in the same step so the variable is always
-      # in scope; no GITHUB_OUTPUT plumbing needed.
-      # ─────────────────────────────────────────────────────────────────────
+      # 10. Demo Turnstile check
       - name: Demo – Turnstile Solve Check (submit + poll, up to 5 retries)
         run: |
           TARGET_URL="https://deltastudy.site/verify"
           SITEKEY="0x4AAAAAADnpjMgvQPlaYYog"
           MAX_RETRIES=5
 
+          get_json() {
+            python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(d.get('$1', ''))
+except Exception:
+    print('')
+"
+          }
+
           for ATTEMPT in $(seq 1 $MAX_RETRIES); do
             echo "══════════════════════════════════════════"
             echo "Attempt $ATTEMPT / $MAX_RETRIES"
             echo "══════════════════════════════════════════"
 
-            # ── SUBMIT ──────────────────────────────────────────────────────
-            # API response: {"errorId":0,"taskId":"<uuid>"}   (camelCase!)
             RESPONSE=$(curl -sf \
               "http://localhost:6080/turnstile?url=${TARGET_URL}&sitekey=${SITEKEY}" \
               2>&1) || true
             echo "Submit response: $RESPONSE"
 
-            TASK_ID=$(echo "$RESPONSE" | \
-              python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('taskId',''))" \
-              2>/dev/null || true)
+            TASK_ID=$(echo "$RESPONSE" | get_json taskId)
 
             if [ -z "$TASK_ID" ] || [ "$TASK_ID" = "null" ]; then
               echo "::warning::No taskId in submit response on attempt $ATTEMPT."
-              if [ "$ATTEMPT" -lt "$MAX_RETRIES" ]; then
-                sleep 5
-                continue
-              fi
+              if [ "$ATTEMPT" -lt "$MAX_RETRIES" ]; then sleep 5; continue; fi
               echo "::error::Could not get a taskId after $MAX_RETRIES attempts."
               cat solver.log || true
               exit 1
@@ -125,44 +146,50 @@ jobs:
 
             echo "Got taskId: $TASK_ID — polling for result…"
 
-            # ── POLL (up to 90 s, every 5 s = 18 ticks) ────────────────────
             SOLVED=false
             for TICK in $(seq 1 18); do
               sleep 5
               RESULT=$(curl -sf "http://localhost:6080/result?id=${TASK_ID}" 2>&1) || true
               echo "  [tick ${TICK}/18] $RESULT"
 
-              STATUS=$(echo "$RESULT" | \
-                python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('status',''))" \
-                2>/dev/null || true)
-
-              if [ "$STATUS" = "ready" ]; then
-                TOKEN=$(echo "$RESULT" | \
-                  python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('value',''))" \
-                  2>/dev/null || true)
-                ELAPSED=$(echo "$RESULT" | \
-                  python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('elapsed_time',''))" \
-                  2>/dev/null || true)
-                echo ""
-                echo "╔══════════════════════════════════════╗"
-                echo "║          ✅  SUCCESS                 ║"
-                echo "╚══════════════════════════════════════╝"
-                echo ""
-                echo "  Attempt  : $ATTEMPT / $MAX_RETRIES"
-                echo "  taskId   : $TASK_ID"
-                echo "  Token    : ${TOKEN:0:50}…"
-                echo "  Elapsed  : ${ELAPSED}s"
-                echo ""
-                SOLVED=true
+              ERROR_ID=$(echo "$RESULT" | get_json errorId)
+              if [ "$ERROR_ID" = "1" ]; then
+                ERROR_CODE=$(echo "$RESULT" | get_json errorCode)
+                echo "::warning::Hard error on tick $TICK (attempt $ATTEMPT): $ERROR_CODE"
                 break
-              elif [ "$STATUS" = "fail" ]; then
-                echo "::warning::Solver returned status=fail (tick $TICK, attempt $ATTEMPT). Will retry."
-                break
-              elif [ "$STATUS" = "processing" ]; then
-                echo "  Still processing…"
-              else
-                echo "  Unexpected status '${STATUS}', continuing to poll…"
               fi
+
+              STATUS=$(echo "$RESULT" | get_json status)
+
+              case "$STATUS" in
+                ready)
+                  TOKEN=$(echo "$RESULT"   | get_json value)
+                  ELAPSED=$(echo "$RESULT" | get_json elapsed_time)
+                  echo ""
+                  echo "╔══════════════════════════════════════╗"
+                  echo "║          ✅  SUCCESS                 ║"
+                  echo "╚══════════════════════════════════════╝"
+                  echo ""
+                  echo "  Attempt  : $ATTEMPT / $MAX_RETRIES"
+                  echo "  taskId   : $TASK_ID"
+                  echo "  Token    : ${TOKEN:0:50}…"
+                  echo "  Elapsed  : ${ELAPSED}s"
+                  echo ""
+                  SOLVED=true
+                  ;;
+                fail)
+                  echo "::warning::Solver returned status=fail on tick $TICK (attempt $ATTEMPT). Will retry."
+                  break
+                  ;;
+                processing)
+                  echo "  Still processing…"
+                  ;;
+                *)
+                  echo "  Waiting for result (status='${STATUS}')…"
+                  ;;
+              esac
+
+              $SOLVED && break
             done
 
             if $SOLVED; then
@@ -171,7 +198,8 @@ jobs:
             fi
 
             if [ "$ATTEMPT" -lt "$MAX_RETRIES" ]; then
-              echo "Attempt $ATTEMPT did not resolve. Retrying with a fresh task…"
+              echo "Attempt $ATTEMPT did not resolve. Retrying with a fresh proxy + task…"
+              sleep 3
             fi
           done
 
@@ -179,12 +207,12 @@ jobs:
           cat solver.log || true
           exit 1
 
-      # 10. Always print solver log on failure for easy debugging
+      # 11. Always print solver log on failure for easy debugging
       - name: Print solver log (on failure)
         if: failure()
         run: cat solver.log || echo "No solver log found"
 
-      # 11. Stop background solver gracefully
+      # 12. Stop background solver gracefully
       - name: Stop solver
         if: always()
         run: |
