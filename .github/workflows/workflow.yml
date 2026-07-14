@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Check out the repo (brings in your committed proxies.txt file)
+      # 1. Check out the repo
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -51,31 +51,17 @@ jobs:
             libxfixes3 libxrandr2 libgbm1 libasound2t64 libpango-1.0-0 \
             libcairo2 libxshmfence1 libx11-xcb1
 
-      # 7. Validate and clean the repository's proxies.txt
-      #    The solver expects this exact filename in the root directory.
-      - name: Verify and clean proxies.txt
+      # 7. Write the specific requested proxy to proxies.txt
+      - name: Configure target proxy
         run: |
-          if [ ! -f proxies.txt ]; then
-            echo "::error::proxies.txt was not found in the root of the repository."
-            exit 1
-          fi
+          echo "65.111.2.203:3129:agbz0cni8e7a:2cmygd095dfjec" > proxies.txt
+          echo "Successfully wrote proxy to proxies.txt"
           
-          # Strip Windows-style \r line endings and remove empty lines in-place
-          sed -i 's/\r//g' proxies.txt
-          sed -i '/^[[:space:]]*$/d' proxies.txt
-          
-          PROXY_COUNT=$(wc -l < proxies.txt)
-          echo "Successfully loaded $PROXY_COUNT proxies from repository."
-          
-          # Show hosts only for validation (redacting potential credentials)
-          echo "Proxy hosts (first 10):"
-          awk -F: '{print $1":"$2}' proxies.txt | head -10
-          if [ "$PROXY_COUNT" -gt 10 ]; then
-            echo "  … and $((PROXY_COUNT - 10)) more"
-          fi
+          # Show host for validation (redacting credentials)
+          echo "Configured proxy host:"
+          awk -F: '{print $1":"$2}' proxies.txt
 
       # 8. Start the solver API in the background
-      #    --proxy is a simple switch; it automatically reads the local proxies.txt file.
       - name: Start Turnstile Solver API
         run: |
           source venv/bin/activate
@@ -107,11 +93,11 @@ jobs:
             sleep 1
           done
 
-      # 10. Demo Turnstile check
+      # 10. Demo Turnstile check using your specific target URL and Sitekey
       - name: Demo – Turnstile Solve Check (submit + poll, up to 5 retries)
         run: |
-          TARGET_URL="https://deltastudy.site/verify"
-          SITEKEY="0x4AAAAAADnpjMgvQPlaYYog"
+          TARGET_URL="https://turnstile-demo.pages.dev/"
+          SITEKEY="0x4AAAAAAAA6ulk8fhx8AjD"
           MAX_RETRIES=5
 
           get_json() {
@@ -179,7 +165,7 @@ jobs:
                   echo "  Still processing…"
                   ;;
                 *)
-                  echo "  Waiting for result (status='${STATUS}')mW…"
+                  echo "  Waiting for result (status='${STATUS}')…"
                   ;;
               esac
 
