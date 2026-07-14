@@ -55,7 +55,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
             libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
-            libxfixes3 libxrandr2 libgbm1 libasound2 libpango-1.0-0 \
+            libxfixes3 libxrandr2 libgbm1 libasound2t64 libpango-1.0-0 \
             libcairo2 libxshmfence1 libx11-xcb1
 
       # 6. Start the solver API in the background
@@ -104,9 +104,8 @@ jobs:
       - name: Demo – Submit Turnstile Solve Task (with retries)
         id: submit_task
         run: |
-          # Cloudflare's public test sitekey (always passes)
-          TARGET_URL="https://cloudflare.com"
-          SITEKEY="1x00000000000000000000AA"
+          TARGET_URL="https://deltastudy.site/verify"
+          SITEKEY="0x4AAAAAADnpjMgvQPlaYYog"
           MAX_RETRIES=5
           ATTEMPT=0
           TASK_ID=""
