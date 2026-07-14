@@ -51,17 +51,17 @@ jobs:
             libxfixes3 libxrandr2 libgbm1 libasound2t64 libpango-1.0-0 \
             libcairo2 libxshmfence1 libx11-xcb1
 
-      # 7. Write the specific requested proxy to proxies.txt
+      # 7. Configure the target proxy with the required http:// protocol prefix
       - name: Configure target proxy
         run: |
-          echo "65.111.2.203:3129:agbz0cni8e7a:2cmygd095dfjec" > proxies.txt
-          echo "Successfully wrote proxy to proxies.txt"
+          echo "http://65.111.2.203:3129:agbz0cni8e7a:2cmygd095dfjec" > proxies.txt
+          echo "Successfully wrote correctly formatted proxy to proxies.txt"
           
           # Show host for validation (redacting credentials)
           echo "Configured proxy host:"
-          awk -F: '{print $1":"$2}' proxies.txt
+          awk -F: '{print $1":"$2":"$3}' proxies.txt
 
-      # 8. Start the solver API in the background
+      # 8. Start the solver API in the background with a custom User-Agent and debug logs
       - name: Start Turnstile Solver API
         run: |
           source venv/bin/activate
@@ -71,6 +71,8 @@ jobs:
             --port 6080 \
             --host 0.0.0.0 \
             --proxy \
+            --useragent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" \
+            --debug \
             > solver.log 2>&1 &
           echo $! > solver.pid
           echo "Solver PID: $(cat solver.pid)"
@@ -93,16 +95,17 @@ jobs:
             sleep 1
           done
 
-      # 10. Demo Turnstile check using your specific target URL and Sitekey
+      # 10. Demo Turnstile check using official demo pages and robust response parsers
       - name: Demo – Turnstile Solve Check (submit + poll, up to 5 retries)
         run: |
           TARGET_URL="https://turnstile-demo.pages.dev/"
           SITEKEY="0x4AAAAAAAA6ulk8fhx8AjD"
           MAX_RETRIES=5
 
-          get_json() {
-            python3 -c "import sys, json; d = json.load(sys.stdin); print(d.get('$1', ''))" 2>/dev/null || echo ""
-          }
+          # One-liner JSON helpers resilient to different API response variations (camelCase vs snake_case)
+          get_task_id() { python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('taskId', d.get('task_id', '')))" 2>/dev/null || echo ""; }
+          get_status()  { python3 -c "import sys, json; d=json.load(sys.stdin); print(d.get('status', ''))" 2>/dev/null || echo ""; }
+          get_token()   { python3 -c "import sys, json; d=json.load(sys.stdin); s=d.get('solution', d); print(s.get('token', d.get('value', d.get('token', ''))) if isinstance(s, dict) else s)" 2>/dev/null || echo ""; }
 
           for ATTEMPT in $(seq 1 $MAX_RETRIES); do
             echo "══════════════════════════════════════════"
@@ -114,7 +117,7 @@ jobs:
               2>&1) || true
             echo "Submit response: $RESPONSE"
 
-            TASK_ID=$(echo "$RESPONSE" | get_json taskId)
+            TASK_ID=$(echo "$RESPONSE" | get_task_id)
 
             if [ -z "$TASK_ID" ] || [ "$TASK_ID" = "null" ]; then
               echo "::warning::No taskId in submit response on attempt $ATTEMPT."
@@ -132,19 +135,11 @@ jobs:
               RESULT=$(curl -sf "http://localhost:6080/result?id=${TASK_ID}" 2>&1) || true
               echo "  [tick ${TICK}/18] $RESULT"
 
-              ERROR_ID=$(echo "$RESULT" | get_json errorId)
-              if [ "$ERROR_ID" = "1" ]; then
-                ERROR_CODE=$(echo "$RESULT" | get_json errorCode)
-                echo "::warning::Hard error on tick $TICK (attempt $ATTEMPT): $ERROR_CODE"
-                break
-              fi
-
-              STATUS=$(echo "$RESULT" | get_json status)
+              STATUS=$(echo "$RESULT" | get_status)
 
               case "$STATUS" in
                 ready)
-                  TOKEN=$(echo "$RESULT"   | get_json value)
-                  ELAPSED=$(echo "$RESULT" | get_json elapsed_time)
+                  TOKEN=$(echo "$RESULT" | get_token)
                   echo ""
                   echo "╔══════════════════════════════════════╗"
                   echo "║          ✅  SUCCESS                 ║"
@@ -153,7 +148,6 @@ jobs:
                   echo "  Attempt  : $ATTEMPT / $MAX_RETRIES"
                   echo "  taskId   : $TASK_ID"
                   echo "  Token    : ${TOKEN:0:50}…"
-                  echo "  Elapsed  : ${ELAPSED}s"
                   echo ""
                   SOLVED=true
                   ;;
@@ -178,7 +172,7 @@ jobs:
             fi
 
             if [ "$ATTEMPT" -lt "$MAX_RETRIES" ]; then
-              echo "Attempt $ATTEMPT did not resolve. Retrying with a fresh proxy + task…"
+              echo "Attempt $ATTEMPT did not resolve. Retrying with a fresh browser instance…"
               sleep 3
             fi
           done
